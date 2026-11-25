@@ -27,6 +27,21 @@ def _add_edge(graph: nx.DiGraph, relation: Relation, chunk_id: str) -> None:
     edge["weight"] = len(edge["sources"])
 
 
+def _resolve_replacement_conflicts(graph: nx.DiGraph) -> int:
+    pairs = [
+        (old, new)
+        for old, new, kind in graph.edges(data="type")
+        if kind == "REPLACED_BY" and old < new and graph.has_edge(new, old)
+    ]
+    for old, new in pairs:
+        forward, backward = graph.edges[old, new]["weight"], graph.edges[new, old]["weight"]
+        if forward <= backward:
+            graph.remove_edge(old, new)
+        if backward <= forward:
+            graph.remove_edge(new, old)
+    return len(pairs)
+
+
 def build_graph(results: list[ExtractionResult]) -> nx.DiGraph:
     """Объединяет результаты по всем чанкам в один направленный граф.
 
@@ -43,4 +58,5 @@ def build_graph(results: list[ExtractionResult]) -> nx.DiGraph:
         for relation in result.relations:
             if relation.matches_schema():
                 _add_edge(graph, relation, result.chunk_id)
+    graph.graph["conflicts"] = _resolve_replacement_conflicts(graph)
     return graph
