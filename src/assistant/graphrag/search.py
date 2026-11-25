@@ -11,13 +11,17 @@ from assistant.infra.schemas import Answer, KnowledgeBase
 
 NOT_FOUND = "в базе знаний не найдено"
 PATH_LENGTH = 3
+NEIGHBOURHOOD_DEPTH = 2
 MAX_FACTS_CHARS = 8000
 LOCAL_SYSTEM = (
     "Ты ассистент сервисной службы компании «ПолярТех». Отвечай на вопрос только по пронумерованным фактам ниже. "
     "Факт «A -СВЯЗЬ-> B» означает, что связь направлена от A к B. "
+    "Если деталь заменена по цепочке REPLACED_BY, называй последнюю деталь цепочки. "
     "Коды моделей, деталей, ошибок и регламентов пиши точно как в фактах. "
     f"Если ответа в фактах нет, напиши: «{NOT_FOUND}»."
 )
+
+Edge = tuple[str, str]
 
 
 def find_anchors(question: str, kb: KnowledgeBase) -> list[str] | None:
@@ -28,7 +32,7 @@ def find_anchors(question: str, kb: KnowledgeBase) -> list[str] | None:
     return codes + [node for node in names if node in kb.graph]
 
 
-def path_edges(graph: nx.DiGraph, anchors: list[str]) -> set[tuple[str, str]]:
+def path_edges(graph: nx.DiGraph, anchors: list[str]) -> set[Edge]:
     undirected = graph.to_undirected(as_view=True)
     edges = set()
     for source, target in combinations(anchors, 2):
@@ -37,15 +41,41 @@ def path_edges(graph: nx.DiGraph, anchors: list[str]) -> set[tuple[str, str]]:
     return edges
 
 
-def number_facts(facts: list[str]) -> str:
-    lines, size = [], 0
-    for index, fact in enumerate(facts, 1):
-        line = f"{index}. {fact}"
-        size += len(line) + 1
+def neighbourhood_edges(graph: nx.DiGraph, anchor: str) -> set[Edge]:
+    nodes = nx.ego_graph(graph.to_undirected(as_view=True), anchor, radius=NEIGHBOURHOOD_DEPTH)
+    return set(graph.subgraph(nodes).edges)
+
+
+def replacement_edges(graph: nx.DiGraph, edges: set[Edge]) -> set[Edge]:
+    found = set()
+    parts = [node for edge in edges for node in edge if graph.nodes[node]["type"] == "Part"]
+    while parts:
+        part = parts.pop()
+        for _, new, kind in graph.out_edges(part, data="type"):
+            if kind == "REPLACED_BY" and (part, new) not in found:
+                found.add((part, new))
+                parts.append(new)
+    return found
+
+
+def select_edges(graph: nx.DiGraph, anchors: list[str]) -> set[Edge]:
+    edges = path_edges(graph, anchors) if len(anchors) > 1 else neighbourhood_edges(graph, anchors[0])
+    return edges | replacement_edges(graph, edges)
+
+
+def fit_facts(graph: nx.DiGraph, edges: set[Edge]) -> list[tuple[Edge, str]]:
+    kept, size = [], 0
+    for index, edge in enumerate(sorted(edges), 1):
+        fact = describe_edge(graph, *edge)
+        size += len(f"{index}. {fact}\n")
         if size > MAX_FACTS_CHARS:
             break
-        lines.append(line)
-    return "\n".join(lines)
+        kept.append((edge, fact))
+    return kept
+
+
+def documents(graph: nx.DiGraph, edges: list[Edge]) -> list[str]:
+    return list(dict.fromkeys(chunk.split("#")[0] for edge in edges for chunk in graph.edges[edge]["sources"]))
 
 
 def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
@@ -59,13 +89,19 @@ def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     `Answer(..., refused=True)` без вызова модели.
     """
     anchors = find_anchors(question, kb)
-    edges = path_edges(kb.graph, anchors) if anchors else set()
-    if not edges:
+    kept = fit_facts(kb.graph, select_edges(kb.graph, anchors)) if anchors else []
+    if not kept:
         return Answer(NOT_FOUND, refused=True)
-    facts = [describe_edge(kb.graph, source, target) for source, target in sorted(edges)]
-    prompt = f"Факты:\n{number_facts(facts)}\n\nВопрос: {question}"
-    reply = llm.chat([{"role": "system", "content": LOCAL_SYSTEM}, {"role": "user", "content": prompt}])
-    return Answer(reply.content, facts=facts, refused=NOT_FOUND in reply.content.lower())
+    facts = [fact for _, fact in kept]
+    numbered = "\n".join(f"{index}. {fact}" for index, fact in enumerate(facts, 1))
+    reply = llm.chat(
+        [
+            {"role": "system", "content": LOCAL_SYSTEM},
+            {"role": "user", "content": f"Факты:\n{numbered}\n\nВопрос: {question}"},
+        ]
+    )
+    sources = documents(kb.graph, [edge for edge, _ in kept])
+    return Answer(reply.content, sources=sources, facts=facts, refused=NOT_FOUND in reply.content.lower())
 
 
 def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
