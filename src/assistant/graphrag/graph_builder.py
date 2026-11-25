@@ -2,7 +2,29 @@
 
 import networkx as nx
 
-from assistant.infra.schemas import ExtractionResult
+from assistant.infra.schemas import Entity, ExtractionResult, Relation
+
+
+def _add_source(sources: list[str], chunk_id: str) -> None:
+    if chunk_id not in sources:
+        sources.append(chunk_id)
+
+
+def _add_node(graph: nx.DiGraph, entity: Entity, chunk_id: str) -> None:
+    if entity.node_id not in graph:
+        graph.add_node(entity.node_id, type=entity.type, name=entity.name, sources=[])
+    _add_source(graph.nodes[entity.node_id]["sources"], chunk_id)
+
+
+def _add_edge(graph: nx.DiGraph, relation: Relation, chunk_id: str) -> None:
+    source, target = relation.subject.node_id, relation.object.node_id
+    for entity in (relation.subject, relation.object):
+        _add_node(graph, entity, chunk_id)
+    if not graph.has_edge(source, target):
+        graph.add_edge(source, target, type=relation.type, sources=[])
+    edge = graph.edges[source, target]
+    _add_source(edge["sources"], chunk_id)
+    edge["weight"] = len(edge["sources"])
 
 
 def build_graph(results: list[ExtractionResult]) -> nx.DiGraph:
@@ -14,5 +36,11 @@ def build_graph(results: list[ExtractionResult]) -> nx.DiGraph:
     деталями есть `REPLACED_BY` в обе стороны, остаётся связь с большим весом, при равенстве
     отбрасываются обе. Число таких конфликтов записывается в `graph.graph["conflicts"]`.
     """
-    # TODO: узлы, рёбра с весами, проверка схемы, разбор встречных замен
-    raise NotImplementedError("Реализуйте build_graph")
+    graph = nx.DiGraph(conflicts=0)
+    for result in results:
+        for entity in result.entities:
+            _add_node(graph, entity, result.chunk_id)
+        for relation in result.relations:
+            if relation.matches_schema():
+                _add_edge(graph, relation, result.chunk_id)
+    return graph
