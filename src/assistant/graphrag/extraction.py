@@ -15,6 +15,8 @@ from assistant.infra.schemas import (
     Relation,
 )
 
+ATTEMPTS = 2
+
 RELATION_MEANINGS = {
     "BELONGS_TO": "модель входит в линейку",
     "HAS_PART": "в модели установлена деталь",
@@ -168,5 +170,11 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
     Функция не падает ни на каком ответе модели: одна повторная попытка, затем пустой результат.
     """
     vocab = vocabulary()
-    response = llm.chat(_messages(chunk, vocab), json_schema=EXTRACTION_SCHEMA)
-    return _result(chunk, json.loads(response.content), vocab)
+    messages = _messages(chunk, vocab)
+    for _ in range(ATTEMPTS):
+        response = llm.chat(messages, json_schema=EXTRACTION_SCHEMA)
+        try:
+            return _result(chunk, json.loads(response.content), vocab)
+        except (ValueError, KeyError, TypeError, AttributeError):
+            continue
+    return ExtractionResult(chunk.chunk_id, chunk.doc_id)
