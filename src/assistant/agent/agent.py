@@ -1,6 +1,7 @@
 """Цикл агента. Требования FR-7, FR-8, FR-9 и FR-10."""
 
 import json
+import re
 from collections.abc import Callable
 from contextlib import suppress
 
@@ -24,6 +25,8 @@ SYSTEM_PROMPT = (
 REFUSAL = "в базе знаний не найдено"
 ERP_DOWN = "Данные ERP получить не удалось."
 ERP_ATTEMPTS = 3
+ORDER_TOOL = "create_service_order"
+NUMBER = re.compile(r"(?<![\w-])\d+(?![\w-])")
 REQUIRED = {schema["function"]["name"]: schema["function"]["parameters"]["required"] for schema in TOOL_SCHEMAS}
 
 
@@ -71,7 +74,27 @@ class _AgentRun:
             for call in response.tool_calls:
                 if len(self.steps) >= self.max_steps:
                     return self._interrupted()
+                held = self._hold_order(call)
+                if held:
+                    return held
                 self.messages.append(tool_message(call, self._execute(call)))
+
+    def _hold_order(self, call: ToolCall) -> AgentResult | None:
+        if call.name != ORDER_TOOL or self._rejection(call):
+            return None
+        args = call.arguments
+        if args["qty"] not in _numbers(self.question):
+            self.steps.append(ToolStep(call.name, args, error="количество не названо пользователем"))
+            question = f"Сколько штук {args['part_id']} заказать? В вопросе количество не названо."
+            return AgentResult(question, self.steps, self._sources())
+        if self.confirm:
+            return None
+        answer = (
+            f"Готов оформить заказ: {args['part_id']}, {args['qty']} шт., склад {args['warehouse']}, "
+            f"модель {args['model']}. Подтвердите заказ."
+        )
+        pending = {"tool": ORDER_TOOL, "args": args}
+        return AgentResult(answer, self.steps, self._sources(), needs_confirmation=True, pending_action=pending)
 
     def _execute(self, call: ToolCall) -> dict:
         error = self._rejection(call)
@@ -134,3 +157,7 @@ class _AgentRun:
     def _sources(self) -> list[str]:
         sources = [source for step in self.steps if step.result for source in step.result.get("sources", [])]
         return list(dict.fromkeys(sources))
+
+
+def _numbers(text: str) -> set[int]:
+    return {int(number) for number in NUMBER.findall(text)}
