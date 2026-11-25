@@ -2,8 +2,10 @@
 
 import json
 from collections.abc import Callable
+from contextlib import suppress
 
 from assistant.agent.tools import TOOL_SCHEMAS
+from assistant.infra.erp_client import ErpUnavailable
 from assistant.infra.grounding import find_codes, normalize_code
 from assistant.infra.llm import LLMClient, ToolCall, tool_message
 from assistant.infra.schemas import AgentResult, ToolStep
@@ -20,6 +22,8 @@ SYSTEM_PROMPT = (
     "Если данных нет, ответь: «В базе знаний не найдено»."
 )
 REFUSAL = "в базе знаний не найдено"
+ERP_DOWN = "Данные ERP получить не удалось."
+ERP_ATTEMPTS = 3
 REQUIRED = {schema["function"]["name"]: schema["function"]["parameters"]["required"] for schema in TOOL_SCHEMAS}
 
 
@@ -56,6 +60,7 @@ class _AgentRun:
         self.messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": question}]
         self.steps: list[ToolStep] = []
         self.done: dict[str, dict] = {}
+        self.erp_down = False
 
     def run(self) -> AgentResult:
         while True:
@@ -75,10 +80,22 @@ class _AgentRun:
             return {"error": error}
         key = json.dumps([call.name, call.arguments], ensure_ascii=False, sort_keys=True)
         if key not in self.done:
-            self.done[key] = self.tools[call.name](**call.arguments)
+            try:
+                self.done[key] = self._call_with_retries(call)
+            except ErpUnavailable as exc:
+                self.erp_down = True
+                error = f"{ERP_DOWN} {exc}"
+                self.steps.append(ToolStep(call.name, call.arguments, error=error))
+                return {"error": error}
         result = self.done[key]
         self.steps.append(ToolStep(call.name, call.arguments, result=result, error=result.get("error")))
         return result
+
+    def _call_with_retries(self, call: ToolCall) -> dict:
+        for _ in range(ERP_ATTEMPTS - 1):
+            with suppress(ErpUnavailable):
+                return self.tools[call.name](**call.arguments)
+        return self.tools[call.name](**call.arguments)
 
     def _rejection(self, call: ToolCall) -> str | None:
         if call.name not in self.tools or call.name not in REQUIRED:
@@ -99,6 +116,8 @@ class _AgentRun:
         return "\n".join([self.question, *results])
 
     def _finish(self, answer: str) -> AgentResult:
+        if self.erp_down and ERP_DOWN.lower() not in answer.lower():
+            answer = f"{answer} {ERP_DOWN}".strip()
         return AgentResult(answer, self.steps, self._sources(), refused=REFUSAL in answer.lower())
 
     def _interrupted(self) -> AgentResult:
