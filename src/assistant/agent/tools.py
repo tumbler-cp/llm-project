@@ -3,7 +3,8 @@
 from collections.abc import Callable
 
 from assistant.graphrag.search import global_search, local_search
-from assistant.infra.erp_client import ErpClient
+from assistant.infra.erp_client import ErpClient, ErpNotFound, ErpRejected
+from assistant.infra.grounding import code_type, normalize_code
 from assistant.infra.llm import LLMClient
 from assistant.infra.schemas import KnowledgeBase
 
@@ -62,13 +63,19 @@ def build_tools(kb: KnowledgeBase, llm: LLMClient, erp: ErpClient) -> dict[str, 
         return {"answer": answer.text, "sources": answer.sources, "refused": answer.refused}
 
     def check_stock(part_id: str, warehouse: str) -> dict:
-        return erp.get_stock(part_id, warehouse)
+        part = _part(part_id)
+        error = _part_error(part_id, part) or _warehouse_error(warehouse)
+        return {"error": error} if error else _ask_erp(erp.get_stock, part, warehouse)
 
     def get_price(part_id: str) -> dict:
-        return erp.get_price(part_id)
+        part = _part(part_id)
+        error = _part_error(part_id, part)
+        return {"error": error} if error else _ask_erp(erp.get_price, part)
 
     def create_service_order(part_id: str, warehouse: str, qty: int, model: str) -> dict:
-        return erp.create_order(part_id, warehouse, qty, model)
+        part = _part(part_id)
+        error = _part_error(part_id, part) or _warehouse_error(warehouse) or _qty_error(qty)
+        return {"error": error} if error else _ask_erp(erp.create_order, part, warehouse, qty, model)
 
     return {
         "search_knowledge": search_knowledge,
@@ -77,3 +84,30 @@ def build_tools(kb: KnowledgeBase, llm: LLMClient, erp: ErpClient) -> dict[str, 
         "get_price": get_price,
         "create_service_order": create_service_order,
     }
+
+
+def _part(part_id: object) -> str | None:
+    code = normalize_code(str(part_id))
+    return code if code and code_type(code) == "Part" else None
+
+
+def _part_error(part_id: object, part: str | None) -> str | None:
+    return None if part else f"неверный номер детали {part_id!r}: нужен вид P-1042 или P-1042B"
+
+
+def _warehouse_error(warehouse: object) -> str | None:
+    return None if warehouse in WAREHOUSES else f"неизвестный склад {warehouse!r}, допустимые: {', '.join(WAREHOUSES)}"
+
+
+def _qty_error(qty: object) -> str | None:
+    valid = isinstance(qty, int) and not isinstance(qty, bool) and qty > 0
+    return None if valid else f"количество должно быть целым числом больше нуля, получено {qty!r}"
+
+
+def _ask_erp(request: Callable[..., dict], *args) -> dict:
+    try:
+        return request(*args)
+    except ErpNotFound as exc:
+        return {"error": f"данных нет: {exc}"}
+    except ErpRejected as exc:
+        return {"error": f"ERP отклонила запрос: {exc}"}
