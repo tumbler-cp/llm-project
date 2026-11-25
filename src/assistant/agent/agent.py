@@ -23,6 +23,7 @@ SYSTEM_PROMPT = (
     "Если данных нет, ответь: «В базе знаний не найдено»."
 )
 REFUSAL = "в базе знаний не найдено"
+UNGROUNDED = "В базе знаний не найдено: ответ не удалось сверить с вопросом и результатами инструментов."
 ERP_DOWN = "Данные ERP получить не удалось."
 ERP_ATTEMPTS = 3
 ORDER_TOOL = "create_service_order"
@@ -64,12 +65,16 @@ class _AgentRun:
         self.steps: list[ToolStep] = []
         self.done: dict[str, dict] = {}
         self.erp_down = False
+        self.corrected = False
 
     def run(self) -> AgentResult:
         while True:
             response = self.llm.chat(self.messages, tools=TOOL_SCHEMAS)
             if not response.tool_calls:
-                return self._finish(response.content)
+                result = self._finish(response.content)
+                if result:
+                    return result
+                continue
             self.messages.append(response.as_message())
             for call in response.tool_calls:
                 if len(self.steps) >= self.max_steps:
@@ -134,11 +139,28 @@ class _AgentRun:
             )
         return None
 
+    def _ungrounded(self, answer: str) -> list[str]:
+        evidence = self._evidence()
+        codes = [code for code in find_codes(answer) if code not in find_codes(evidence)]
+        numbers = _numbers(answer) - {int(number) for number in re.findall(r"\d+", evidence)}
+        return codes + [str(number) for number in sorted(numbers)]
+
     def _evidence(self) -> str:
         results = [json.dumps(step.result, ensure_ascii=False) for step in self.steps if step.result]
         return "\n".join([self.question, *results])
 
-    def _finish(self, answer: str) -> AgentResult:
+    def _finish(self, answer: str) -> AgentResult | None:
+        unknown = self._ungrounded(answer)
+        if unknown and not self.corrected:
+            self.corrected = True
+            feedback = (
+                f"В ответе есть значения, которых нет в вопросе и результатах инструментов: {', '.join(unknown)}. "
+                "Исправь ответ и используй только эти данные."
+            )
+            self.messages += [{"role": "assistant", "content": answer}, {"role": "user", "content": feedback}]
+            return None
+        if unknown:
+            return AgentResult(UNGROUNDED, self.steps, self._sources(), refused=True)
         if self.erp_down and ERP_DOWN.lower() not in answer.lower():
             answer = f"{answer} {ERP_DOWN}".strip()
         return AgentResult(answer, self.steps, self._sources(), refused=REFUSAL in answer.lower())
