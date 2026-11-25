@@ -56,7 +56,7 @@ def build_graph(results: list[ExtractionResult]) -> nx.DiGraph:
         for entity in result.entities:
             _add_node(graph, entity, result.chunk_id)
         for relation in result.relations:
-            if relation.matches_schema():
+            if relation.matches_schema() and relation.subject != relation.object:
                 _add_edge(graph, relation, result.chunk_id)
     graph.graph["conflicts"] = _resolve_replacement_conflicts(graph)
     return graph
