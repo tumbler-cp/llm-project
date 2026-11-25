@@ -16,6 +16,7 @@ from assistant.infra.schemas import (
 )
 
 ATTEMPTS = 2
+MAX_TOKENS = 4096
 
 RELATION_MEANINGS = {
     "BELONGS_TO": "модель входит в линейку",
@@ -172,7 +173,7 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
     vocab = vocabulary()
     messages = _messages(chunk, vocab)
     for _ in range(ATTEMPTS):
-        response = llm.chat(messages, json_schema=EXTRACTION_SCHEMA)
+        response = llm.chat(messages, json_schema=EXTRACTION_SCHEMA, max_tokens=MAX_TOKENS)
         try:
             return _result(chunk, json.loads(response.content), vocab)
         except (ValueError, KeyError, TypeError, AttributeError):
