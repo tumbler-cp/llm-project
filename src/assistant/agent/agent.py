@@ -4,6 +4,7 @@ import json
 from collections.abc import Callable
 
 from assistant.agent.tools import TOOL_SCHEMAS
+from assistant.infra.grounding import find_codes, normalize_code
 from assistant.infra.llm import LLMClient, ToolCall, tool_message
 from assistant.infra.schemas import AgentResult, ToolStep
 
@@ -85,7 +86,17 @@ class _AgentRun:
         required = REQUIRED[call.name]
         if set(call.arguments) != set(required):
             return f"нечитаемые аргументы {call.arguments}, нужны: {', '.join(required)}"
+        part_id = call.arguments.get("part_id")
+        if part_id is not None and normalize_code(str(part_id)) not in find_codes(self._evidence()):
+            return (
+                f"номер детали {part_id!r} не встречался в вопросе и результатах инструментов. "
+                "Вызови search_knowledge, чтобы узнать номер детали"
+            )
         return None
+
+    def _evidence(self) -> str:
+        results = [json.dumps(step.result, ensure_ascii=False) for step in self.steps if step.result]
+        return "\n".join([self.question, *results])
 
     def _finish(self, answer: str) -> AgentResult:
         return AgentResult(answer, self.steps, self._sources(), refused=REFUSAL in answer.lower())
