@@ -3,7 +3,7 @@
 import json
 
 from assistant.infra.config import vocabulary
-from assistant.infra.grounding import canonical_name
+from assistant.infra.grounding import CODE_TYPES, canonical_name, find_codes
 from assistant.infra.llm import LLMClient
 from assistant.infra.schemas import (
     ENTITY_TYPES,
@@ -125,24 +125,37 @@ def _messages(chunk: Chunk, vocab: dict[str, list[str]]) -> list[dict]:
     return messages
 
 
-def _entity(entity_type: str, raw: str, vocab: dict[str, list[str]]) -> Entity | None:
-    name = canonical_name(entity_type, raw, vocab)
-    return Entity(entity_type, name) if name else None
+class _Grounding:
+    def __init__(self, chunk: Chunk, vocab: dict[str, list[str]]) -> None:
+        self.codes = set(find_codes(chunk.text))
+        self.vocab = vocab
+
+    def entity(self, entity_type: str, raw: str) -> Entity | None:
+        name = canonical_name(entity_type, raw, self.vocab)
+        if name is None or (entity_type in CODE_TYPES and name not in self.codes):
+            return None
+        return Entity(entity_type, name)
 
 
 def _result(chunk: Chunk, data: dict, vocab: dict[str, list[str]]) -> ExtractionResult:
+    grounding = _Grounding(chunk, vocab)
+    dropped = 0
     entities = {}
     for item in data["entities"]:
-        entity = _entity(item["type"], item["name"], vocab)
+        entity = grounding.entity(item["type"], item["name"])
         if entity:
             entities[entity.node_id] = entity
+        else:
+            dropped += 1
     relations = []
     for item in data["relations"]:
-        subject = _entity(item["subject_type"], item["subject"], vocab)
-        obj = _entity(item["object_type"], item["object"], vocab)
+        subject = grounding.entity(item["subject_type"], item["subject"])
+        obj = grounding.entity(item["object_type"], item["object"])
         if subject and obj:
             relations.append(Relation(subject, item["type"], obj))
-    return ExtractionResult(chunk.chunk_id, chunk.doc_id, list(entities.values()), relations)
+        else:
+            dropped += 1
+    return ExtractionResult(chunk.chunk_id, chunk.doc_id, list(entities.values()), relations, dropped)
 
 
 def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
