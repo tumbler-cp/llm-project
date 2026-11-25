@@ -1,5 +1,7 @@
 """Два режима поиска по графу. Требования FR-4, FR-5 и FR-10."""
 
+import json
+from collections.abc import Iterable
 from itertools import combinations, pairwise
 
 import networkx as nx
@@ -7,7 +9,7 @@ import networkx as nx
 from assistant.graphrag.facts import describe_edge
 from assistant.infra.grounding import code_type, find_codes, find_names
 from assistant.infra.llm import LLMClient
-from assistant.infra.schemas import Answer, KnowledgeBase
+from assistant.infra.schemas import MAP_SCHEMA, Answer, Community, KnowledgeBase
 
 NOT_FOUND = "в базе знаний не найдено"
 PATH_LENGTH = 3
@@ -19,6 +21,16 @@ LOCAL_SYSTEM = (
     "Если деталь заменена по цепочке REPLACED_BY, называй последнюю деталь цепочки. "
     "Коды моделей, деталей, ошибок и регламентов пиши точно как в фактах. "
     f"Если ответа в фактах нет, напиши: «{NOT_FOUND}»."
+)
+MAP_SYSTEM = (
+    "Ты помогаешь ответить на обзорный вопрос по сводке одной части графа знаний компании «ПолярТех». "
+    "Верни JSON: answer – частичный ответ только по этой сводке, score – насколько сводка помогает ответить, "
+    "от 0 до 10. Если сводка не помогает, поставь score 0."
+)
+REDUCE_SYSTEM = (
+    "Ты ассистент сервисной службы компании «ПолярТех». Объедини частичные ответы в один ответ на вопрос. "
+    "Пиши только то, что есть в частичных ответах, числа и коды переноси без изменений. "
+    f"Если ответа в них нет, напиши: «{NOT_FOUND}»."
 )
 
 Edge = tuple[str, str]
@@ -74,8 +86,23 @@ def fit_facts(graph: nx.DiGraph, edges: set[Edge]) -> list[tuple[Edge, str]]:
     return kept
 
 
-def documents(graph: nx.DiGraph, edges: list[Edge]) -> list[str]:
-    return list(dict.fromkeys(chunk.split("#")[0] for edge in edges for chunk in graph.edges[edge]["sources"]))
+def documents(chunks: Iterable[str]) -> list[str]:
+    return list(dict.fromkeys(chunk.split("#")[0] for chunk in chunks))
+
+
+def map_summary(question: str, community: Community, llm: LLMClient) -> tuple[int, str]:
+    reply = llm.chat(
+        [
+            {"role": "system", "content": MAP_SYSTEM},
+            {"role": "user", "content": f"Сводка:\n{community.summary}\n\nВопрос: {question}"},
+        ],
+        json_schema=MAP_SCHEMA,
+    )
+    try:
+        data = json.loads(reply.content)
+        return int(data["score"]), str(data["answer"])
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return 0, ""
 
 
 def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
@@ -100,7 +127,7 @@ def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
             {"role": "user", "content": f"Факты:\n{numbered}\n\nВопрос: {question}"},
         ]
     )
-    sources = documents(kb.graph, [edge for edge, _ in kept])
+    sources = documents(chunk for edge, _ in kept for chunk in kb.graph.edges[edge]["sources"])
     return Answer(reply.content, sources=sources, facts=facts, refused=NOT_FOUND in reply.content.lower())
 
 
@@ -111,5 +138,18 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     Шаг reduce: частичные ответы с оценкой выше 0 объединяются в итоговый ответ.
     Если таких ответов нет, возвращается `Answer(..., refused=True)`.
     """
-    # TODO: частичные ответы по сводкам, объединение
-    raise NotImplementedError("Реализуйте global_search")
+    partials = [(*map_summary(question, community, llm), community) for community in kb.communities]
+    useful = sorted((partial for partial in partials if partial[0] > 0), key=lambda partial: -partial[0])
+    if not useful:
+        return Answer(NOT_FOUND, refused=True)
+    numbered = "\n".join(f"{index}. {answer}" for index, (_, answer, _) in enumerate(useful, 1))
+    reply = llm.chat(
+        [
+            {"role": "system", "content": REDUCE_SYSTEM},
+            {"role": "user", "content": f"Частичные ответы:\n{numbered}\n\nВопрос: {question}"},
+        ]
+    )
+    sources = documents(
+        chunk for _, _, community in useful for node in community.nodes for chunk in kb.graph.nodes[node]["sources"]
+    )
+    return Answer(reply.content, sources=sources, refused=NOT_FOUND in reply.content.lower())
