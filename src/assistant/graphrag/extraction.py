@@ -1,7 +1,174 @@
 """Извлечение сущностей и связей из чанка. Требование FR-1."""
 
+import json
+
+from assistant.infra.config import vocabulary
+from assistant.infra.grounding import CODE_TYPES, canonical_name, find_codes
 from assistant.infra.llm import LLMClient
-from assistant.infra.schemas import Chunk, ExtractionResult
+from assistant.infra.schemas import (
+    ENTITY_TYPES,
+    EXTRACTION_SCHEMA,
+    RELATION_SIGNATURES,
+    Chunk,
+    Entity,
+    ExtractionResult,
+    Relation,
+)
+
+ATTEMPTS = 2
+MAX_TOKENS = 4096
+
+RELATION_MEANINGS = {
+    "BELONGS_TO": "модель входит в линейку",
+    "HAS_PART": "в модели установлена деталь",
+    "IS_A": "деталь является узлом этого вида",
+    "INDICATES": "код ошибки указывает на отказ узла",
+    "FIXED_BY": "ошибка устраняется по регламенту",
+    "REPLACED_BY": "старая деталь снята с производства и заменена новой: старая -> новая",
+    "SUPPLIED_BY": "деталь поставляет поставщик",
+    "FAILED": "в отчёте о выезде у модели зафиксирован отказ узла",
+}
+
+EXAMPLES = [
+    (
+        "# Руководство по эксплуатации: моноблок BZ-990\n\n"
+        "Моноблок BZ-990 входит в линейку «Бриз».\n\n"
+        "## Состав узлов\n\nВ BZ-990 установлены следующие узлы.\n\n"
+        "- компрессор – деталь P-9010, поставщик «КомпрессорМаш»\n"
+        "- контроллер – деталь P-9014, поставщик «АвтоматикаСевер»\n\n"
+        "## Коды ошибок\n\n- E-91 – перегрев компрессора, отказ узла «компрессор»",
+        {
+            "entities": [
+                {"type": "Model", "name": "BZ-990"},
+                {"type": "ProductLine", "name": "Бриз"},
+                {"type": "Part", "name": "P-9010"},
+                {"type": "Part", "name": "P-9014"},
+                {"type": "Component", "name": "компрессор"},
+                {"type": "Component", "name": "контроллер"},
+                {"type": "Supplier", "name": "КомпрессорМаш"},
+                {"type": "Supplier", "name": "АвтоматикаСевер"},
+                {"type": "ErrorCode", "name": "E-91"},
+            ],
+            "relations": [
+                ["Model", "BZ-990", "BELONGS_TO", "ProductLine", "Бриз"],
+                ["Model", "BZ-990", "HAS_PART", "Part", "P-9010"],
+                ["Part", "P-9010", "IS_A", "Component", "компрессор"],
+                ["Part", "P-9010", "SUPPLIED_BY", "Supplier", "КомпрессорМаш"],
+                ["Model", "BZ-990", "HAS_PART", "Part", "P-9014"],
+                ["Part", "P-9014", "IS_A", "Component", "контроллер"],
+                ["Part", "P-9014", "SUPPLIED_BY", "Supplier", "АвтоматикаСевер"],
+                ["ErrorCode", "E-91", "INDICATES", "Component", "компрессор"],
+            ],
+        },
+    ),
+    (
+        "# Сервисный бюллетень SB-2099-01\n\n"
+        "Деталь P-9020 (датчик температуры) снята с производства, вместо неё ставится P-9020B "
+        "от «ТермоПрибор». Ошибка E-92 устраняется по регламенту SP-199.",
+        {
+            "entities": [
+                {"type": "Part", "name": "P-9020"},
+                {"type": "Part", "name": "P-9020B"},
+                {"type": "Component", "name": "датчик температуры"},
+                {"type": "Supplier", "name": "ТермоПрибор"},
+                {"type": "ErrorCode", "name": "E-92"},
+                {"type": "Procedure", "name": "SP-199"},
+            ],
+            "relations": [
+                ["Part", "P-9020", "REPLACED_BY", "Part", "P-9020B"],
+                ["Part", "P-9020", "IS_A", "Component", "датчик температуры"],
+                ["Part", "P-9020B", "IS_A", "Component", "датчик температуры"],
+                ["Part", "P-9020B", "SUPPLIED_BY", "Supplier", "ТермоПрибор"],
+                ["ErrorCode", "E-92", "FIXED_BY", "Procedure", "SP-199"],
+            ],
+        },
+    ),
+    (
+        "# Отчёт о выезде R-2099-001\n\nОборудование: витрина ar 990. На панели код Е-93.\n\n"
+        "Диагностика показала отказ узла: вентилятор испарителя.",
+        {
+            "entities": [
+                {"type": "Model", "name": "AR-990"},
+                {"type": "ErrorCode", "name": "E-93"},
+                {"type": "Component", "name": "вентилятор испарителя"},
+            ],
+            "relations": [
+                ["Model", "AR-990", "FAILED", "Component", "вентилятор испарителя"],
+                ["ErrorCode", "E-93", "INDICATES", "Component", "вентилятор испарителя"],
+            ],
+        },
+    ),
+]
+
+
+def _system_prompt(vocab: dict[str, list[str]]) -> str:
+    relations = "\n".join(
+        f"- {kind}: {subject} -> {obj} ({RELATION_MEANINGS[kind]})"
+        for kind, (subject, obj) in RELATION_SIGNATURES.items()
+    )
+    names = "\n".join(f"- {kind}: {', '.join(items)}" for kind, items in vocab.items())
+    return (
+        "Ты извлекаешь граф знаний из документа сервисной службы холодильного оборудования.\n"
+        f"Типы сущностей: {', '.join(ENTITY_TYPES)}.\n"
+        "Коды пиши канонически: модели AR-210, детали P-1042 и P-1042B, ошибки E-17, регламенты SP-104.\n"
+        f"Названия линеек, узлов и поставщиков бери только из словаря:\n{names}\n"
+        f"Связи и их направление, начало -> конец:\n{relations}\n"
+        "Для каждой детали из состава узлов модели выпиши три связи: модель HAS_PART деталь, "
+        "деталь IS_A узел, деталь SUPPLIED_BY поставщик.\n"
+        "Извлекай только то, что прямо сказано в тексте. Не придумывай коды. "
+        "Номера бюллетеней и отчётов не являются сущностями. Если связей нет, верни пустые списки.\n"
+        "Ответ – JSON с полями entities и relations."
+    )
+
+
+def _example_answer(answer: dict) -> str:
+    relations = [
+        {"subject_type": st, "subject": s, "type": kind, "object_type": ot, "object": o}
+        for st, s, kind, ot, o in answer["relations"]
+    ]
+    return json.dumps({"entities": answer["entities"], "relations": relations}, ensure_ascii=False)
+
+
+def _messages(chunk: Chunk, vocab: dict[str, list[str]]) -> list[dict]:
+    messages = [{"role": "system", "content": _system_prompt(vocab)}]
+    for text, answer in EXAMPLES:
+        messages.append({"role": "user", "content": text})
+        messages.append({"role": "assistant", "content": _example_answer(answer)})
+    messages.append({"role": "user", "content": chunk.text})
+    return messages
+
+
+class _Grounding:
+    def __init__(self, chunk: Chunk, vocab: dict[str, list[str]]) -> None:
+        self.codes = set(find_codes(chunk.text))
+        self.vocab = vocab
+
+    def entity(self, entity_type: str, raw: str) -> Entity | None:
+        name = canonical_name(entity_type, raw, self.vocab)
+        if name is None or (entity_type in CODE_TYPES and name not in self.codes):
+            return None
+        return Entity(entity_type, name)
+
+
+def _result(chunk: Chunk, data: dict, vocab: dict[str, list[str]]) -> ExtractionResult:
+    grounding = _Grounding(chunk, vocab)
+    dropped = 0
+    entities = {}
+    for item in data["entities"]:
+        entity = grounding.entity(item["type"], item["name"])
+        if entity:
+            entities[entity.node_id] = entity
+        else:
+            dropped += 1
+    relations = []
+    for item in data["relations"]:
+        subject = grounding.entity(item["subject_type"], item["subject"])
+        obj = grounding.entity(item["object_type"], item["object"])
+        if subject and obj:
+            relations.append(Relation(subject, item["type"], obj))
+        else:
+            dropped += 1
+    return ExtractionResult(chunk.chunk_id, chunk.doc_id, list(entities.values()), relations, dropped)
 
 
 def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
@@ -13,5 +180,12 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
     связь с отброшенным концом. Пригодятся `find_codes` и `canonical_name` из `assistant.infra.grounding`.
     Функция не падает ни на каком ответе модели: одна повторная попытка, затем пустой результат.
     """
-    # TODO: запрос к модели, разбор JSON, проверки по тексту чанка и словарю
-    raise NotImplementedError("Реализуйте extract_chunk")
+    vocab = vocabulary()
+    messages = _messages(chunk, vocab)
+    for _ in range(ATTEMPTS):
+        response = llm.chat(messages, json_schema=EXTRACTION_SCHEMA, max_tokens=MAX_TOKENS)
+        try:
+            return _result(chunk, json.loads(response.content), vocab)
+        except (ValueError, KeyError, TypeError, AttributeError):
+            continue
+    return ExtractionResult(chunk.chunk_id, chunk.doc_id)
