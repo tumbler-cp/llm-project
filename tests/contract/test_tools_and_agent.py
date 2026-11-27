@@ -223,6 +223,27 @@ def test_answer_with_an_invented_price_is_sent_back_for_correction():
     assert len(llm.requests) == 3 and result.answer == "Цена 2630 руб." and not result.refused
 
 
+@pytest.mark.parametrize("part_id", ["P-1042B", "P 1042"])
+def test_digits_in_the_requested_part_number_do_not_confirm_a_price(part_id):
+    answer = "Деталь стоит 1042 руб."
+    llm = FakeLLM([answer, answer])
+    result = run_agent(f"Сколько стоит деталь {part_id}?", llm, {})
+
+    assert len(llm.requests) == 2
+    assert result.refused and not result.steps
+    assert "1042 руб." not in result.answer
+
+
+def test_digits_in_a_part_number_found_by_search_do_not_confirm_a_price():
+    question = "Сколько стоит пусковое реле для AR-210?"
+    answer = "Деталь стоит 1042 руб."
+    llm = FakeLLM([call("search_knowledge", question=question), answer, answer])
+    result = run_agent(question, llm, Tools().as_dict())
+
+    assert result.refused
+    assert [step.tool for step in result.steps] == ["search_knowledge"]
+
+
 def test_answer_that_stays_invented_becomes_a_refusal():
     tools = Tools()
     llm = FakeLLM(

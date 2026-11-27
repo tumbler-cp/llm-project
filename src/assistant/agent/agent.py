@@ -27,7 +27,7 @@ UNGROUNDED = "В базе знаний не найдено: ответ не уд
 ERP_DOWN = "Данные ERP получить не удалось."
 ERP_ATTEMPTS = 3
 ORDER_TOOL = "create_service_order"
-NUMBER = re.compile(r"(?<![\w-])\d+(?![\w-])")
+NUMBER = re.compile(r"(?:(?<!\w)([^\W\d_]{1,2} )|(?<![\w-]))(\d+)(?![\w-])")
 REQUIRED = {schema["function"]["name"]: schema["function"]["parameters"]["required"] for schema in TOOL_SCHEMAS}
 
 
@@ -142,7 +142,7 @@ class _AgentRun:
     def _ungrounded(self, answer: str) -> list[str]:
         evidence = self._evidence()
         codes = [code for code in find_codes(answer) if code not in find_codes(evidence)]
-        numbers = _numbers(answer) - {int(number) for number in re.findall(r"\d+", evidence)}
+        numbers = _numbers(answer) - _numbers(evidence)
         return codes + [str(number) for number in sorted(numbers)]
 
     def _evidence(self) -> str:
@@ -182,4 +182,4 @@ class _AgentRun:
 
 
 def _numbers(text: str) -> set[int]:
-    return {int(number) for number in NUMBER.findall(text)}
+    return {int(number) for prefix, number in NUMBER.findall(text) if not normalize_code(prefix + number)}
